@@ -1,0 +1,20 @@
+# CONFIGURATION VARIABLES - update before running `install_mediawiki.sh`
+MW_NAME="Site Name"
+DOMAIN_NAME="wiki.EXAMPLE.COM"
+ADMIN_EMAIL="admin@EXAMPLE.COM"
+
+# Database Configuration
+DB_NAME="mediawikidb"
+DB_USER="MY DB USERNAME"
+DB_PASS="MY DB PASSWORD"
+
+# MediaWiki Version (Check mediawiki.org for the latest *stable* release)
+MW_MAJOR="1.45"
+MW_VERSION="1.45.3"
+
+# MediaWiki admin user
+MW_ADMIN_USER="MY ADMIN USERNAME"
+MW_ADMIN_PASS="MY ADMIN PASSWORD"
+
+# Username for the non-root primary Linux login (usually specified by hosting service)
+CLI_USER="ubuntu"
