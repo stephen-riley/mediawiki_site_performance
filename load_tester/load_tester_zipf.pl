@@ -13,6 +13,7 @@ use File::Spec;
 use File::Path qw(make_path remove_tree);
 use Pod::Usage;
 use List::Util qw(shuffle);
+use IPC::ShareLite qw( :lock );
 
 # --- CLI Parameter Setup ---
 my $url_template;
@@ -28,28 +29,38 @@ my $seed;
 my $help           = 0;
 my $max_depth      = 4;
 my $unique         = 0;
+my $bucket_time    = 3;
+my $languages      = 50;
+my $skew           = 1.5;
+my $no_memory_cache = 0;
 
 my $chrome_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 GetOptions(
-    'url=s'           => \$url_template,
-    'requests=i'      => \$req_per_thread,
-    'concurrency|c=i' => \$concurrency,
-    'time-cutoff|t=f' => \$time_cutoff,
-    'max-id=i'        => \$max_id,
-    'cleanup'         => \$cleanup,
-    'verbose|v'       => \$verbose,
-    'temp-dir|d=s'    => \$tmp_dir,
-    'file|f=s'        => \$file_src,
-    'seed|s=i'        => \$seed,
-    'depth=i'         => \$max_depth,
-    'unique|u'        => \$unique,
-    'help|h|?'        => \$help,
+    'url=s'             => \$url_template,
+    'requests=i'        => \$req_per_thread,
+    'concurrency|c=i'   => \$concurrency,
+    'time-cutoff|t=f'   => \$time_cutoff,
+    'max-id=i'          => \$max_id,
+    'cleanup'           => \$cleanup,
+    'verbose|v'         => \$verbose,
+    'temp-dir|d=s'      => \$tmp_dir,
+    'file|f=s'          => \$file_src,
+    'seed|s=i'          => \$seed,
+    'depth=i'           => \$max_depth,
+    'unique|u'          => \$unique,
+    'bucket-time|b'     => \$bucket_time,
+    'languages|l'       => \$languages,
+    'skew|s=f'          => \$skew,
+    'no-memory-cache|n' => \$no_memory_cache,
+    'help|h|?'          => \$help,
 ) or pod2usage(2);
 
 pod2usage(1) if $help || !$url_template;
 
 my $h2_support = eval { require Protocol::HTTP2; 1 } ? "Enabled" : "Disabled (Install Protocol::HTTP2)";
+
+my @cdf = initialize_zipf();
 
 # --- Task Preparation ---
 my @substitutions;
@@ -72,12 +83,13 @@ if ($unique) {
 } else {
     srand($seed) if defined $seed;
     for (1 .. $grand_total) {
-        push @task_list, $file_src ? $substitutions[int(rand(@substitutions))] : int(rand($max_id)) + 1;
+        push @task_list, $file_src ? $substitutions[int(rand(@substitutions))] : get_next_page_id() + 1;
     }
 }
 
-my %stats = ( index => {}, load => {}, internal => {} ); 
+my %stats = ( index => {}, load => {}, internal => {}, cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0 } ); 
 my $slow_304_count = 0;
+my %global_visited;
 my @ttlb_results;
 
 say "Target:      $url_template";
@@ -86,6 +98,14 @@ say "Mode:        " . ($unique ? "Unique Hits" : "Random Hits");
 say "Config:      $concurrency users (Private Browser Caches), Depth: $max_depth";
 say "-" x 115;
 
+my $ipc_key = $$;
+my $share = IPC::ShareLite->new(
+    -key     => $ipc_key,
+    -create  => 'yes',
+    -destroy => 'no'
+) or die "Could not create shared memory segment: $!\n";
+$share->store(0);
+
 my $pm = Parallel::ForkManager->new($concurrency);
 
 $pm->run_on_finish(sub {
@@ -93,6 +113,15 @@ $pm->run_on_finish(sub {
     if (defined $data) {
         $slow_304_count += $data->{slow_304_count} // 0;
         push @ttlb_results, @{$data->{ttlb_vals}} if $data->{ttlb_vals};
+        
+        $stats{cf_cache}{HIT} += $data->{cf_cache}{HIT} // 0;
+        $stats{cf_cache}{MISS} += $data->{cf_cache}{MISS} // 0;
+        $stats{cf_cache}{DYNAMIC} += $data->{cf_cache}{DYNAMIC} // 0;
+
+        while (my ($url, $count) = each %{$data->{visited}}) {
+            $global_visited{$url} += $count;
+        }
+
         foreach my $cat ('index', 'load', 'internal') {
             foreach my $code (keys %{$data->{codes}{$cat}}) {
                 $stats{$cat}{$code} //= { count => 0, sum => 0, max => 0 };
@@ -120,13 +149,27 @@ for my $worker_id (1 .. $concurrency) {
         slow_304_count => 0, 
         codes => { index => {}, load => {}, internal => {} }, 
         ttlb_vals => [],
-        memory_cache => {} 
+        memory_cache => {},
+        visited => {},
+        cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0 },
     };
 
+    my $worker_share = IPC::ShareLite->new(
+        -key     => $ipc_key,
+        -create  => 'no',
+        -destroy => 'no'
+    );
+
     for my $req_num (1 .. scalar @my_tasks) {
+        $worker_share->lock(LOCK_EX);
+        my $current = $worker_share->fetch() + 1;
+        $worker_share->store($current);
+        $worker_share->unlock();
+        my $percent = ($current / $grand_total) * 100;
+
         my $target_url = sprintf($url_template, $my_tasks[$req_num - 1]);
         my $t_page_start = [gettimeofday];
-        fetch_page_recursive($ua, $target_url, 0, $child_data, {}, $worker_id, $req_num, $worker_cache_dir);
+        fetch_page_recursive($ua, $target_url, 0, $child_data, {}, $worker_id, $req_num, $worker_cache_dir, $percent);
         push @{$child_data->{ttlb_vals}}, tv_interval($t_page_start);
     }
 
@@ -135,21 +178,29 @@ for my $worker_id (1 .. $concurrency) {
 }
 
 $pm->wait_all_children;
-render_report(\%stats, \@ttlb_results, scalar @task_list, $slow_304_count, $concurrency, $req_per_thread, $time_cutoff);
+
+my $cleanup_share = IPC::ShareLite->new(
+    -key     => $ipc_key,
+    -create  => 'no',
+    -destroy => 'yes'
+);
+undef $cleanup_share;
+
+render_report(\%stats, \@ttlb_results, scalar @task_list, $slow_304_count, $concurrency, $req_per_thread, $time_cutoff, \%global_visited);
 
 sub fetch_page_recursive {
-    my ($ua, $url, $depth, $data_ref, $seen_ref, $wid, $rid, $cache_dir) = @_;
+    my ($ua, $url, $depth, $data_ref, $seen_ref, $wid, $rid, $cache_dir, $percent) = @_;
     return if $depth > $max_depth || $seen_ref->{$url}++;
 
     my $cat = ($url =~ /load\.php/) ? 'load' : 'index';
     
     my $now = time();
-    if (exists $data_ref->{memory_cache}{$url} && $now < $data_ref->{memory_cache}{$url}) {
+    if (!$no_memory_cache && exists $data_ref->{memory_cache}{$url} && $now < $data_ref->{memory_cache}{$url}) {
         $data_ref->{codes}{internal}{'MEM_HIT'} //= { count => 0, sum => 0, max => 0 };
         $data_ref->{codes}{internal}{'MEM_HIT'}{count}++;
         if ($verbose) {
             my $path = Mojo::URL->new($url)->path_query;
-            printf "[W:%-2d R:%-2d D:%d] MEM | %7.4fs | %s\n", $wid, $rid, $depth, 0.0, $path;
+            printf("[W:%-2d R:%-4d %3.0f%%] MEM | C:- | %7.4fs | %s\n", $wid, $rid, $percent, 0.0, $path) if $path =~ /index\.php/;
         }
         return;
     }
@@ -178,19 +229,37 @@ sub fetch_page_recursive {
     $data_ref->{codes}{$cat}{$code}{sum} += $elapsed;
     $data_ref->{codes}{$cat}{$code}{max} = $elapsed if $elapsed > $data_ref->{codes}{$cat}{$code}{max};
     
+    my $cf_code = '-';
+    if ($res) {
+        my $cf_status = $res->headers->header('cf-cache-status') // '';
+        if ($cf_status =~ /HIT/i) {
+            $data_ref->{cf_cache}{HIT}++;
+            $cf_code = 'H';
+        } elsif ($cf_status =~ /MISS/i) {
+            $data_ref->{cf_cache}{MISS}++;
+            $cf_code = 'm';
+        } else {
+            $data_ref->{cf_cache}{DYNAMIC}++;
+            $cf_code = '-';
+        }
+    }
+
     if ($code == 304 && $elapsed > $time_cutoff) { $data_ref->{slow_304_count}++; }
     if ($verbose) {
         my $path = Mojo::URL->new($url)->path_query;
-        printf "[W:%-2d R:%-2d D:%d] %s | %7.4fs | %s\n", $wid, $rid, $depth, $code, $elapsed, $path;
+        $data_ref->{visited}{$path}++;
+        printf("[W:%-2d R:%-4d %3.0f%%] %s | C:%s | %7.4fs | %-40s %s \n", $wid, $rid, $percent, $code, $cf_code, $elapsed, $path, '*' x ($data_ref->{visited}{$path}-1)) if $path =~ /index\.php/;
     }
 
     return unless $res;
 
-    my $cache_control = $res->headers->cache_control // '';
-    if ($cache_control =~ /max-age=(\d+)/) {
-        $data_ref->{memory_cache}{$url} = $now + $1;
-    } elsif (my $exp = $res->headers->expires) {
-        $data_ref->{memory_cache}{$url} = Mojo::Date->new($exp)->epoch;
+    if (!$no_memory_cache) {
+        my $cache_control = $res->headers->cache_control // '';
+        if ($cache_control =~ /max-age=(\d+)/) {
+            $data_ref->{memory_cache}{$url} = $now + $1;
+        } elsif (my $exp = $res->headers->expires) {
+            $data_ref->{memory_cache}{$url} = Mojo::Date->new($exp)->epoch;
+        }
     }
 
     if ($code == 200) {
@@ -215,7 +284,7 @@ sub fetch_page_recursive {
             Mojo::Promise->all(map { 
                 Mojo::Promise->new(sub {
                     my $resolve = shift;
-                    fetch_page_recursive($ua, $_, $depth + 1, $data_ref, $seen_ref, $wid, $rid, $cache_dir);
+                    fetch_page_recursive($ua, $_, $depth + 1, $data_ref, $seen_ref, $wid, $rid, $cache_dir, $percent);
                     $resolve->();
                 })
             } @next_urls)->wait;
@@ -224,26 +293,37 @@ sub fetch_page_recursive {
 }
 
 sub render_report {
-    my ($stats, $ttlbs, $total_main, $slow, $conc, $req, $cut) = @_;
+    my ($stats, $ttlbs, $total_main, $slow, $conc, $req, $cut, $visited_ref) = @_;
     my $ttlb_count = scalar @$ttlbs;
     my ($ttlb_sum, $ttlb_max) = (0, 0);
     foreach (@$ttlbs) { $ttlb_sum += $_; $ttlb_max = $_ if $_ > $ttlb_max; }
     my $ttlb_avg = $ttlb_count > 0 ? $ttlb_sum / $ttlb_count : 0;
 
+    my $p80 = calculate_p($ttlbs, 0.80);
+    my $p95 = calculate_p($ttlbs, 0.95);
+    my $p99 = calculate_p($ttlbs, 0.99);
+
     say "\n" . "=" x 115;
     say "MEDIAWIKI CONVOY REPORT (v2.8 - Histogram Mode)";
     say "=" x 115;
-    printf "TOTAL PAGE LOAD (TTLB)   | Avg: %10.4fs | Max: %10.4fs\n", $ttlb_avg, $ttlb_max;
+
+    say "Threads: $concurrency | Requests/thread: $req_per_thread | URL: $url_template";
+    say "-" x 115;
+    printf "TOTAL PAGE LOAD (TTLB)   | Avg: %6.4fs | p80: %6.4fs | p95: %6.4fs | p99: %6.4fs | Max: %6.4fs\n", $ttlb_avg, $p80, $p95, $p99, $ttlb_max;
     
+    say "-" x 115;
+    printf "CLOUDFLARE CACHE STATUS  | Hits: %-6d | Misses: %-6d | Dynamic: %-6d\n", $stats->{cf_cache}{HIT}, $stats->{cf_cache}{MISS}, $stats->{cf_cache}{DYNAMIC};
+
     # Histogram Logic
     say "-" x 115;
-    say "TTLB DISTRIBUTION (3s Buckets)";
+    say "TTLB DISTRIBUTION (${bucket_time}s Buckets)";
     say "-" x 115;
     
     my %buckets;
-    my $step = 3;
+    my $step = $bucket_time;
     foreach my $val (@$ttlbs) {
         my $b = int($val / $step) * $step;
+        # my $b = ($val / $step) * $step;
         $buckets{$b}++;
     }
     
@@ -253,8 +333,31 @@ sub render_report {
         my $perc  = ($count / $ttlb_count) * 100;
         my $bar   = "*" x int($perc / 2); # Visual representation
         printf "%2ds - %2ds | %4d | %5.1f%% | %s\n", $lower, $upper, $count, $perc, $bar;
+        # printf "%2.2fs - %2.2fs | %4.2f | %5.1f%% | %s\n", $lower, $upper, $count, $perc, $bar;
     }
 
+    my $total_unique_urls = 0;
+    my $total_all_visits  = 0;
+    my $multi_visit_urls  = 0;
+    my $multi_visit_count = 0;
+
+    while (my ($url, $count) = each %$visited_ref) {
+        $total_unique_urls++;
+        $total_all_visits += $count;
+
+        if ($count > 1) {
+            $multi_visit_urls++;
+            $multi_visit_count += $count;
+        }
+    }
+
+    my $percentage = $total_all_visits > 0 
+        ? ($multi_visit_count / $total_all_visits) * 100 
+        : 0;
+    
+    say "-" x 115;
+    printf "Repeat URLs: %-6d | Repeat count: %-6s | Concentration: %.2f%%\n", $multi_visit_urls, $multi_visit_count, $percentage;
+    
     foreach my $cat ('index', 'load', 'internal') {
         next unless keys %{$stats->{$cat}};
         say "-" x 115;
@@ -270,4 +373,60 @@ sub render_report {
         }
     }
     say "=" x 115;
+}
+
+sub calculate_p {
+    my ($ttlbs, $limit) = @_;
+    my $ttlb_count = scalar @$ttlbs;
+    my $ttlb = 0;
+    if ($ttlb_count > 0) {
+        my @sorted = sort { $a <=> $b } @$ttlbs;
+        my $idx = int($limit * $ttlb_count);
+        $idx = $ttlb_count - 1 if $idx >= $ttlb_count;
+        $ttlb = $sorted[$idx];
+    }
+}
+
+sub initialize_zipf {
+    my $sum = 0;
+    my $ppl = int($max_id / $languages);
+
+    for my $i (1 .. $ppl) {
+        $sum += 1.0 / ($i ** $skew);
+        push @cdf, $sum;
+    }
+
+    # Normalize the array so the final value is exactly 1.0
+    $_ /= $sum for @cdf;
+
+    return @cdf;
+}
+
+sub get_next_page_id {
+    my $ppl = int($max_id / $languages);
+
+    # Step 1: Pick a language bucket uniformly (returns 0 to 49)
+    my $language_bucket = int(rand($languages));
+    
+    # Step 2: Pick a page popularity rank within that language (returns 1 to 6000)
+    my $r = rand();
+    my $low = 0;
+    my $high = $#cdf;
+
+    while ($low < $high) {
+        my $mid = int(($low + $high) / 2);
+        if ($r > $cdf[$mid]) {
+            $low = $mid + 1;
+        } else {
+            $high = $mid;
+        }
+    }
+    my $rank_within_language = $low + 1;
+    
+    # Step 3: Calculate the absolute Page ID
+    # E.g., Bucket 2 * 6000 = base 12000. + rank 1 = Page ID 12001.
+    my $absolute_page_id = ($language_bucket * $ppl) + $rank_within_language;
+    
+    # Catch any edge cases (like rounding errors) pushing past the max
+    return $absolute_page_id > $max_id ? $max_id : $absolute_page_id;
 }

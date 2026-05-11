@@ -31,7 +31,14 @@ apt update
 # Install Apache, MariaDB, Memcached, and PHP 8.4 FPM with required extensions
 apt install -y apache2 mariadb-server imagemagick \
     php8.4-fpm php8.4-mysql php8.4-xml php8.4-mbstring \
-    php8.4-intl php8.4-apcu curl wget unzip python-is-python3
+    php8.4-intl php8.4-apcu curl wget unzip redis php8.4-redis \
+    php-curl python-is-python3
+
+# Set up the cloudflared tunnel
+curl -L https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+apt update
+apt install cloudflared
 
 # Configure MariaDB with larger buffer pool
 cat <<EOF > /etc/mysql/mariadb.conf.d/99-override-buffer-pool-size.cnf
@@ -65,14 +72,35 @@ user = ${DB_USER}
 password = "${DB_PASS}"
 EOF
 
+# Set up redis with 1GB of memory and LRU eviction strategy
+echo "" | sudo tee -a /etc/redis/redis.conf
+echo "# --- MEDIAWIKI CUSTOM REDIS LIMITS ---" | sudo tee -a /etc/redis/redis.conf
+echo "maxmemory 1gb" | sudo tee -a /etc/redis/redis.conf
+echo "maxmemory-policy allkeys-lru" | sudo tee -a /etc/redis/redis.conf
+
+sudo systemctl restart redis-server
+
+# Give each PHP-FPM process 256M
+cat <<EOF > /etc/php/8.4/fpm/conf.d/mediawiki-tuning.ini
+; priority=99
+memory_limit = 256M
+apc.shm_size = 256M
+iopcache.memory_consumption = 128M
+opcache.revalidate_freq = 5
+opcache.interned_strings_buffer = 16
+EOF
+
+phpenmod -s fpm mediawiki-tuning
+
 # Have PHP-FPM always run 8 processes
 cat <<EOF > /etc/php/8.4/fpm/pool.d/zzz-mediawiki-tuning.conf
 ; bump up number of FPM processes allowed
 pm = static
 pm.max_children = 8
+pm.max_requests = 500
 EOF
 
-# Install `luasandbox`
+# Install `luasandbox` and `redis` PHP extensions
 LUASANDBOX_PKG="LuaSandbox-4.1.3"
 apt install -y php-dev liblua5.1-0-dev
 cd /tmp
@@ -86,6 +114,19 @@ make install
 
 echo "extension = luasandbox" > /etc/php/8.4/mods-available/luasandbox.ini
 phpenmod luasandbox
+
+REDIS_PHP_PKG="redis-6.3.0"
+cd /tmp
+wget https://pecl.php.net/get/${REDIS_PHP_PKG}.tgz
+tar -xvzf ${REDIS_PHP_PKG}.tgz
+cd ${REDIS_PHP_PKG}
+phpize
+./configure
+make
+make install
+
+echo "extension = redis" > /etc/php/8.4/mods-available/redis.ini
+phpenmod redis
 
 systemctl restart php8.4-fpm
 
@@ -103,7 +144,7 @@ a2enmod ssl
 cat <<EOF > /etc/apache2/sites-available/${DOMAIN_NAME}.conf
 <VirtualHost *:80>
     ServerName ${DOMAIN_NAME}
-    Redirect permanent / https://${DOMAIN_NAME}
+    Redirect permanent / https://${DOMAIN_NAME}/
 </VirtualHost>
 
 <VirtualHost *:443>
@@ -196,17 +237,36 @@ git clone https://gerrit.wikimedia.org/r/mediawiki/extensions/Screenplay
 git clone -b REL1_45 https://gerrit.wikimedia.org/r/mediawiki/extensions/TimedMediaHandler
 git clone https://gerrit.wikimedia.org/r/mediawiki/extensions/MagicNoCache
 git clone https://gerrit.wikimedia.org/r/mediawiki/extensions/PipeEscape
-
-wget -O Purge.tar.gz https://github.com/NekoCharm01/mediawiki-extensions-Purge/archive/refs/tags/v2.1.1.tar.gz
-tar xvzf Purge.tar.gz
-rm Purge.tar.gz
-mv mediawiki-extensions-Purge-2.1.1/ Purge/
+git clone https://gerrit.wikimedia.org/r/mediawiki/extensions/CloudflarePurge
 
 # Set up base database schema for MediaWiki
 # (This creates a LocalSettings.php file; just ignore it since we'll overwrite it.)
 cd /var/www/mediawiki
 php maintenance/run.php install --dbname $DB_NAME --dbuser $DB_USER --dbpass $DB_PASS \
     --pass "$MW_ADMIN_PASS" "WikiName" "$MW_ADMIN_USER"
+
+# Set up a job runner service
+cat <<EOF > /etc/systemd/system/mw-jobrunner.service
+[Unit]
+Description=MediaWiki Job Runner
+After=network.target redis.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/mediawiki
+ExecStart=/usr/bin/php /var/www/mediawiki/maintenance/runJobs.php --wait
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable mw-jobrunner
+systemctl start mw-jobrunner
 
 # Build LocalSettings.php
 SECRET_KEY=`cat /dev/urandom | tr -dc 'a-f0-9' | head -c 64; echo`
@@ -269,11 +329,17 @@ if ( !defined( 'MEDIAWIKI' ) ) {
 \$wgEmailAuthentication = true;
 
 ## Database settings
-\$wgDBtype = "mysql";
-\$wgDBserver = "localhost:/var/run/mysqld/mysqld.sock";
 \$wgDBname = "${DB_NAME}";
-\$wgDBuser = "${DB_USER}";
-\$wgDBpassword = "${DB_PASS}";
+\$wgDBservers = [
+    [
+        'host' => "localhost:/var/run/mysqld/mysqld.sock",
+        'type' => "mysql",
+        'user' => "${DB_USER}",
+        'password' => "${DB_PASS}",
+        'flags' => DBO_PERSISTENT,
+        'load' => 0
+    ]
+];
 
 # MySQL specific settings
 \$wgDBprefix = "";
@@ -282,15 +348,58 @@ if ( !defined( 'MEDIAWIKI' ) ) {
 # MySQL table options to use during installation or update
 \$wgDBTableOptions = "ENGINE=InnoDB, DEFAULT CHARSET=binary";
 
-# Shared database table
-# This has no effect unless \$wgSharedDB is also set.
-\$wgSharedTables[] = "actor";
+## Cache settings
+\$wgObjectCaches['redis'] = [
+    'class' => 'RedisBagOStuff',
+    'servers' => [ '127.0.0.1:6379' ],
+    'connectTimeout' => 1,
+    'readTimeout' => 1,
+    'persistent' => true,
+];
 
-## Shared memory settings
-\$wgMainCacheType = CACHE_ACCEL;
-\$wgParserCacheType = CACHE_ACCEL;
-\$wgSessionCacheType = CACHE_ACCEL;
-\$wgMemCachedServers = [];
+\$wgMainCacheType = 'redis';
+\$wgParserCacheType = 'redis';
+\$wgMessageCacheType = 'redis';
+\$wgSessionCacheType = 'redis';
+\$wgUseFileCache = true;
+\$wgCacheDirectory = "\$IP/cache";
+\$wgShowIPinHeader = false;
+\$wgInvalidateCacheOnEdit = true;
+
+\$wgUseCdn = true;
+\$wgCdnServersNoPurge = [
+    # Cloudflare IPv4
+    '173.245.48.0/20',
+    '103.21.244.0/22',
+    '103.22.200.0/22',
+    '103.31.4.0/22',
+    '141.101.64.0/18',
+    '108.162.192.0/18',
+    '190.93.240.0/20',
+    '188.114.96.0/20',
+    '197.234.240.0/22',
+    '198.41.128.0/17',
+    '162.158.0.0/15',
+    '104.16.0.0/13',
+    '104.24.0.0/14',
+    '172.64.0.0/13',
+    '131.0.72.0/22',
+    
+    # Cloudflare IPv6
+    '2400:cb00::/32',
+    '2606:4700::/32',
+    '2803:f800::/32',
+    '2405:b500::/32',
+    '2405:8100::/32',
+    '2a06:98c0::/29',
+    '2c0f:f248::/32'
+];
+# This next line *is* correct!
+\$wgCdnServers = [ ];
+
+wfLoadExtension( 'CloudflarePurge' );
+\$wgCloudflarePurgeZoneID = '${CF_ZONE_ID}';
+\$wgCloudflarePurgeToken = '${CF_API_TOKEN}';
 
 ## To enable image uploads, make sure the 'images' directory
 ## is writable, then set this to true:
@@ -431,7 +540,6 @@ define("NS_SOURCES_TALK", 3001);
 # wfLoadExtension( 'TimedMediaHandler' );
 wfLoadExtension( 'MagicNoCache' );
 wfLoadExtension( 'PipeEscape' );
-# wfLoadExtension( 'Purge' );
 
 ## Turning on JavaScript
 \$wgAllowUserJs = true;
@@ -439,16 +547,21 @@ wfLoadExtension( 'PipeEscape' );
 ## Disallow webcrawler robots
 \$wgDefaultRobotPolicy = 'noindex,nofollow';
 
-\$wgDebugLogFile = "/tmp/debug.log";
+# \$wgDebugLogFile = "/tmp/debug.log";
 \$wgShowExceptionDetails = false; 
 
-## We're going to use a cron job to handle MW jobs
+## Job runner configuration
+\$wgJobTypeConf['default'] = [
+    'class'       => 'JobQueueRedis',
+    'redisServer' => '127.0.0.1:6379',
+    'redisConfig' => [
+        'connectTimeout' => 1,
+        'readTimeout' => 1,
+    ],
+    'claimTTL'    => 3600,
+    'daemonized'  => true
+];
 \$wgJobRunRate = 0;
-
-# Enable File Cache for logged-out users
-\$wgUseFileCache = true;
-\$wgFileCacheDirectory = "\$IP/cache";
-\$wgInvalidateCacheOnEdit = true;
 EOF
 
 # update DB schema
@@ -466,8 +579,7 @@ chown -R ${CLI_USER}:${CLI_USER} /var/www/mediawiki/
 # allow www-data processes to write to file cache
 chown www-data:www-data /var/www/mediawiki/cache
 
-# set up cron jobs to run MW jobs in the background and prune the file cache every night at 2am
+# set up cron job to prune the file cache every 7 days
 crontab -u ${CLI_USER} - <<EOF
-* * * * * /usr/bin/php /var/www/mediawiki/maintenance/run.php runJobs --maxtime=55 > /tmp/runJobs.log 2>&1
 0 2 * * * /usr/bin/php /var/www/mediawiki/maintenance/run.php pruneFileCache --agedays 7 > /tmp/pruneCache.log 2>&1
 EOF

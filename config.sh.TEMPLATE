@@ -1,5 +1,6 @@
 # CONFIGURATION VARIABLES - update before running `install_mediawiki.sh`
 MW_NAME="Site Name"
+CF_DOMAIN_NAME="wiki.PUBLIC.EXAMPLE.COM"
 DOMAIN_NAME="wiki.EXAMPLE.COM"
 ADMIN_EMAIL="admin@EXAMPLE.COM"
 
@@ -18,3 +19,8 @@ MW_ADMIN_PASS="MY ADMIN PASSWORD"
 
 # Username for the non-root primary Linux login (usually specified by hosting service)
 CLI_USER="ubuntu"
+
+# Cloudflare config.  Make sure to limit the API token to cache purging only!
+CDN="Cloudflare"
+CF_ZONE_ID="<ZONE ID HERE>"
+CF_API_TOKEN="<API TOKEN HERE>"
