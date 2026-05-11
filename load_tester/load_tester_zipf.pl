@@ -30,8 +30,8 @@ my $help           = 0;
 my $max_depth      = 4;
 my $unique         = 0;
 my $bucket_time    = 3;
-my $languages      = 50;
-my $skew           = 1.5;
+my $site_sections  = 50;
+my $skew           = 1.1;
 my $no_memory_cache = 0;
 
 my $chrome_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
@@ -46,12 +46,12 @@ GetOptions(
     'verbose|v'         => \$verbose,
     'temp-dir|d=s'      => \$tmp_dir,
     'file|f=s'          => \$file_src,
-    'seed|s=i'          => \$seed,
+    'seed|e=i'          => \$seed,
     'depth=i'           => \$max_depth,
     'unique|u'          => \$unique,
-    'bucket-time|b'     => \$bucket_time,
-    'languages|l'       => \$languages,
-    'skew|s=f'          => \$skew,
+    'bucket-time|b=i'   => \$bucket_time,
+    'site-sections|s=i' => \$site_sections,
+    'skew|k=f'          => \$skew,
     'no-memory-cache|n' => \$no_memory_cache,
     'help|h|?'          => \$help,
 ) or pod2usage(2);
@@ -389,7 +389,7 @@ sub calculate_p {
 
 sub initialize_zipf {
     my $sum = 0;
-    my $ppl = int($max_id / $languages);
+    my $ppl = int($max_id / $site_sections);
 
     for my $i (1 .. $ppl) {
         $sum += 1.0 / ($i ** $skew);
@@ -403,12 +403,12 @@ sub initialize_zipf {
 }
 
 sub get_next_page_id {
-    my $ppl = int($max_id / $languages);
+    my $ppl = int($max_id / $site_sections);
 
-    # Step 1: Pick a language bucket uniformly (returns 0 to 49)
-    my $language_bucket = int(rand($languages));
+    # Step 1: Pick a site section uniformly (returns 0 to 49)
+    my $section_bucket = int(rand($site_sections));
     
-    # Step 2: Pick a page popularity rank within that language (returns 1 to 6000)
+    # Step 2: Pick a page popularity rank within that section (returns 1 to 6000)
     my $r = rand();
     my $low = 0;
     my $high = $#cdf;
@@ -421,11 +421,11 @@ sub get_next_page_id {
             $high = $mid;
         }
     }
-    my $rank_within_language = $low + 1;
+    my $rank_within_section = $low + 1;
     
     # Step 3: Calculate the absolute Page ID
     # E.g., Bucket 2 * 6000 = base 12000. + rank 1 = Page ID 12001.
-    my $absolute_page_id = ($language_bucket * $ppl) + $rank_within_language;
+    my $absolute_page_id = ($section_bucket * $ppl) + $rank_within_section;
     
     # Catch any edge cases (like rounding errors) pushing past the max
     return $absolute_page_id > $max_id ? $max_id : $absolute_page_id;
