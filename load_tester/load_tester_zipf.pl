@@ -12,8 +12,7 @@ use Getopt::Long;
 use File::Spec;
 use File::Path qw(make_path remove_tree);
 use Pod::Usage;
-use List::Util qw(shuffle);
-use IPC::ShareLite qw( :lock );
+use List::Util qw(shuffle sum max);
 
 # --- CLI Parameter Setup ---
 my $url_template;
@@ -87,7 +86,7 @@ if ($unique) {
     }
 }
 
-my %stats = ( index => {}, load => {}, internal => {}, cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0 } ); 
+my %stats = ( index => {}, load => {}, internal => {}, cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0, HIT_VALS => [], MISS_VALS => [] } );
 my $slow_304_count = 0;
 my %global_visited;
 my @ttlb_results;
@@ -97,14 +96,6 @@ say "HTTP/2:      $h2_support";
 say "Mode:        " . ($unique ? "Unique Hits" : "Random Hits");
 say "Config:      $concurrency users (Private Browser Caches), Depth: $max_depth";
 say "-" x 115;
-
-my $ipc_key = $$;
-my $share = IPC::ShareLite->new(
-    -key     => $ipc_key,
-    -create  => 'yes',
-    -destroy => 'no'
-) or die "Could not create shared memory segment: $!\n";
-$share->store(0);
 
 my $pm = Parallel::ForkManager->new($concurrency);
 
@@ -117,6 +108,8 @@ $pm->run_on_finish(sub {
         $stats{cf_cache}{HIT} += $data->{cf_cache}{HIT} // 0;
         $stats{cf_cache}{MISS} += $data->{cf_cache}{MISS} // 0;
         $stats{cf_cache}{DYNAMIC} += $data->{cf_cache}{DYNAMIC} // 0;
+        push @{$stats{cf_cache}{HIT_VALS}}, @{$data->{cf_cache}{HIT_VALS} // []};
+        push @{$stats{cf_cache}{MISS_VALS}}, @{$data->{cf_cache}{MISS_VALS} // []};
 
         while (my ($url, $count) = each %{$data->{visited}}) {
             $global_visited{$url} += $count;
@@ -151,21 +144,11 @@ for my $worker_id (1 .. $concurrency) {
         ttlb_vals => [],
         memory_cache => {},
         visited => {},
-        cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0 },
+        cf_cache => { HIT => 0, MISS => 0, DYNAMIC => 0, HIT_VALS => [], MISS_VALS => [] },
     };
 
-    my $worker_share = IPC::ShareLite->new(
-        -key     => $ipc_key,
-        -create  => 'no',
-        -destroy => 'no'
-    );
-
     for my $req_num (1 .. scalar @my_tasks) {
-        $worker_share->lock(LOCK_EX);
-        my $current = $worker_share->fetch() + 1;
-        $worker_share->store($current);
-        $worker_share->unlock();
-        my $percent = ($current / $grand_total) * 100;
+        my $percent = ($req_num / scalar @my_tasks) * 100;
 
         my $target_url = sprintf($url_template, $my_tasks[$req_num - 1]);
         my $t_page_start = [gettimeofday];
@@ -178,13 +161,6 @@ for my $worker_id (1 .. $concurrency) {
 }
 
 $pm->wait_all_children;
-
-my $cleanup_share = IPC::ShareLite->new(
-    -key     => $ipc_key,
-    -create  => 'no',
-    -destroy => 'yes'
-);
-undef $cleanup_share;
 
 render_report(\%stats, \@ttlb_results, scalar @task_list, $slow_304_count, $concurrency, $req_per_thread, $time_cutoff, \%global_visited);
 
@@ -234,10 +210,16 @@ sub fetch_page_recursive {
         my $cf_status = $res->headers->header('cf-cache-status') // '';
         if ($cf_status =~ /HIT/i) {
             $data_ref->{cf_cache}{HIT}++;
+            push @{$data_ref->{cf_cache}{HIT_VALS}}, $elapsed;
             $cf_code = 'H';
         } elsif ($cf_status =~ /MISS/i) {
             $data_ref->{cf_cache}{MISS}++;
+            push @{$data_ref->{cf_cache}{MISS_VALS}}, $elapsed;
             $cf_code = 'm';
+        } elsif ($cf_status =~ /EXPIRED/i) {
+            $data_ref->{cf_cache}{MISS}++;
+            push @{$data_ref->{cf_cache}{MISS_VALS}}, $elapsed;
+            $cf_code = 'x';
         } else {
             $data_ref->{cf_cache}{DYNAMIC}++;
             $cf_code = '-';
@@ -313,6 +295,24 @@ sub render_report {
     
     say "-" x 115;
     printf "CLOUDFLARE CACHE STATUS  | Hits: %-6d | Misses: %-6d | Dynamic: %-6d\n", $stats->{cf_cache}{HIT}, $stats->{cf_cache}{MISS}, $stats->{cf_cache}{DYNAMIC};
+    
+    if (scalar @{$stats->{cf_cache}{HIT_VALS}} > 0) {
+        my $h_avg = sum(@{$stats->{cf_cache}{HIT_VALS}}) / scalar @{$stats->{cf_cache}{HIT_VALS}};
+        my $h_p80 = calculate_p($stats->{cf_cache}{HIT_VALS}, 0.80);
+        my $h_p95 = calculate_p($stats->{cf_cache}{HIT_VALS}, 0.95);
+        my $h_p99 = calculate_p($stats->{cf_cache}{HIT_VALS}, 0.99);
+        my $h_max = max(@{$stats->{cf_cache}{HIT_VALS}});
+        printf "  -> HIT TIMES           | Avg: %6.4fs | p80: %6.4fs | p95: %6.4fs | p99: %6.4fs | Max: %6.4fs\n", $h_avg, $h_p80, $h_p95, $h_p99, $h_max;
+    }
+
+    if (scalar @{$stats->{cf_cache}{MISS_VALS}} > 0) {
+        my $m_avg = sum(@{$stats->{cf_cache}{MISS_VALS}}) / scalar @{$stats->{cf_cache}{MISS_VALS}};
+        my $m_p80 = calculate_p($stats->{cf_cache}{MISS_VALS}, 0.80);
+        my $m_p95 = calculate_p($stats->{cf_cache}{MISS_VALS}, 0.95);
+        my $m_p99 = calculate_p($stats->{cf_cache}{MISS_VALS}, 0.99);
+        my $m_max = max(@{$stats->{cf_cache}{MISS_VALS}});
+        printf "  -> MISS TIMES          | Avg: %6.4fs | p80: %6.4fs | p95: %6.4fs | p99: %6.4fs | Max: %6.4fs\n", $m_avg, $m_p80, $m_p95, $m_p99, $m_max;
+    }
 
     # Histogram Logic
     say "-" x 115;

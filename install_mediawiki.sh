@@ -367,6 +367,7 @@ if ( !defined( 'MEDIAWIKI' ) ) {
 \$wgInvalidateCacheOnEdit = true;
 
 \$wgUseCdn = true;
+\$wgCdnMaxAge = 2592000;
 \$wgCdnServersNoPurge = [
     # Cloudflare IPv4
     '173.245.48.0/20',
